@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -45,9 +46,7 @@ the same feature columns to classify.
 
 
 # =================================================================
-# Helpers for the LD1/LD2 projection figure (shared by step 1 and 2
-# so unknown samples can be overlaid onto the same figure/boundaries
-# once they've been classified).
+# Helpers
 # =================================================================
 def _clip_line_to_box(a, b, c, x_lo, x_hi, y_lo, y_hi):
     """Points where line a*x + b*y + c = 0 crosses the given box, or None
@@ -97,230 +96,178 @@ def _write_sheet_with_notes(writer, df, sheet_name, notes, index=True, index_lab
         worksheet.column_dimensions["A"].width = 100
 
 
+def fit_extra_axis(model, X_scaled, y):
+    """Second plot axis for the 2-class case: PC1 of the within-class
+    variation, made orthogonal to the LD1 direction."""
+    if X_scaled.shape[1] < 2:
+        return None
+    w = model.scalings_[:, 0]
+    w = w / np.linalg.norm(w)
+    resid = X_scaled.copy()
+    for c in np.unique(y):
+        resid[y == c] -= resid[y == c].mean(axis=0)
+    resid = resid - np.outer(resid @ w, w)
+    if not np.any(resid):
+        return None
+    v = PCA(n_components=1).fit(resid).components_[0]
+    return {"vec": v, "mean": X_scaled.mean(axis=0)}
+
+
+def project_2d(model, X_scaled, extra_axis):
+    """Return an (n, 2) array: LD1 and either LD2 or the extra axis."""
+    ld = model.transform(X_scaled)
+    if ld.shape[1] >= 2:
+        return ld[:, :2]
+    if extra_axis is None:
+        return np.column_stack([ld[:, 0], np.zeros(len(ld))])
+    return np.column_stack([ld[:, 0], (X_scaled - extra_axis["mean"]) @ extra_axis["vec"]])
+
+
 def build_projection_figure(
-    labels, class_colors, plot_df, n_components, max_components,
-    class_means_ld=None, priors_arr=None, unknown_df=None, highlight_idx=None,
+    labels, class_colors, plot_df, class_means_ld, region_means, priors_arr,
+    y_label="LD2", unknown_df=None, highlight_idx=None,
 ):
-    """Build the LD projection figure (shaded decision regions + pairwise
-    boundary lines when the plot contains the model's full discriminant
-    space), optionally overlaying already-classified unknown samples as
-    white dot markers.
-
-    plot_df: DataFrame with columns 'Class', 'LD1', and 'LD2' if n_components >= 2.
-    unknown_df: optional DataFrame with columns 'LD1' (+ 'LD2' if applicable),
-                'Predicted_class', 'Sample' (a display label for hover text).
-                Expected to have a plain 0..n-1 RangeIndex.
-    highlight_idx: optional collection of positional row indices (into
-        unknown_df) to draw as larger, highlighted markers — e.g. rows
-        currently selected in a results table.
-
-    Returns (fig, boundary_formulas, boundaries_are_exact).
-    """
+    """2D projection with shaded decision regions and pairwise boundaries.
+    class_means_ld: centroid positions (for the markers).
+    region_means: positions used to compute regions/boundaries (for the
+        2-class case the 2nd coordinate is 0, so boundaries are vertical).
+    plot_df / unknown_df use columns 'LD1' and 'LD2' (LD2 may hold the extra axis).
+    unknown_df additionally needs 'Sample' and 'Predicted_class' and a plain
+    0..n-1 RangeIndex. highlight_idx = positional rows of unknown_df to highlight."""
     boundary_formulas = []
     has_unknown = unknown_df is not None and len(unknown_df) > 0
     highlight_idx = set(highlight_idx) if highlight_idx else set()
+    hover_tail = f"<br>LD1: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>"
 
-    def _unknown_traces(x_col, y_col=None):
+    def _unknown_traces():
         n = len(unknown_df)
-        hover_text = (
-            unknown_df["Sample"].to_numpy() if "Sample" in unknown_df else np.array([""] * n)
-        )
-        pred_text = unknown_df["Predicted_class"].to_numpy()
-        x_all = unknown_df[x_col].to_numpy()
-        y_all = unknown_df[y_col].to_numpy() if y_col is not None else np.zeros(n)
+        hover = unknown_df["Sample"].to_numpy()
+        pred = unknown_df["Predicted_class"].to_numpy()
+        x_all, y_all = unknown_df["LD1"].to_numpy(), unknown_df["LD2"].to_numpy()
         is_hl = np.array([i in highlight_idx for i in range(n)])
+        specs = [
+            (~is_hl, "Unknown sample",
+             dict(symbol="circle", size=10, color="white", line=dict(width=2, color="black"))),
+            (is_hl, "Selected sample",
+             dict(symbol="circle", size=18, color="#FFD700", line=dict(width=3, color="red"))),
+        ]
+        out = []
+        for mask, name, marker in specs:
+            if mask.any():
+                out.append(go.Scatter(
+                    x=x_all[mask], y=y_all[mask], mode="markers", marker=marker, name=name,
+                    customdata=np.stack([hover[mask], pred[mask]], axis=-1),
+                    hovertemplate="Sample: %{customdata[0]}<br>Predicted: %{customdata[1]}" + hover_tail,
+                ))
+        return out
 
-        traces = []
-        base_mask = ~is_hl
-        if base_mask.any():
-            traces.append(
-                go.Scatter(
-                    x=x_all[base_mask], y=y_all[base_mask], mode="markers",
-                    marker=dict(symbol="circle", size=10, color="white", line=dict(width=2, color="black")),
-                    name="Unknown sample",
-                    customdata=np.stack([hover_text[base_mask], pred_text[base_mask]], axis=-1),
-                    hovertemplate="Sample: %{customdata[0]}<br>Predicted: %{customdata[1]}"
-                                  "<br>LD1: %{x:.3f}" + ("<br>LD2: %{y:.3f}" if y_col is not None else "")
-                                  + "<extra></extra>",
-                )
+    all_ld1, all_ld2 = list(plot_df["LD1"]), list(plot_df["LD2"])
+    if has_unknown:
+        all_ld1 += list(unknown_df["LD1"])
+        all_ld2 += list(unknown_df["LD2"])
+    ld1_lo, ld1_hi = min(all_ld1), max(all_ld1)
+    ld2_lo, ld2_hi = min(all_ld2), max(all_ld2)
+    pad1 = 0.15 * (ld1_hi - ld1_lo) if ld1_hi > ld1_lo else 1.0
+    pad2 = 0.15 * (ld2_hi - ld2_lo) if ld2_hi > ld2_lo else 1.0
+    ld1_lo, ld1_hi = ld1_lo - pad1, ld1_hi + pad1
+    ld2_lo, ld2_hi = ld2_lo - pad2, ld2_hi + pad2
+
+    # Decision regions: nearest centroid (with priors) on a grid
+    grid_res = 300
+    ld1_grid = np.linspace(ld1_lo, ld1_hi, grid_res)
+    ld2_grid = np.linspace(ld2_lo, ld2_hi, grid_res)
+    LD1_mesh, LD2_mesh = np.meshgrid(ld1_grid, ld2_grid)
+    mesh_points = np.stack([LD1_mesh.ravel(), LD2_mesh.ravel()], axis=1)
+    diffs = mesh_points[:, None, :] - region_means[None, :, :]
+    scores = -0.5 * np.sum(diffs ** 2, axis=2) + np.log(priors_arr)[None, :]
+    region_idx = np.argmax(scores, axis=1).reshape(LD1_mesh.shape)
+    n_cls = len(region_means)
+
+    colorscale = []
+    for i, cls in enumerate(labels):
+        colorscale.append([i / n_cls, class_colors[cls]])
+        colorscale.append([(i + 1) / n_cls, class_colors[cls]])
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        x=ld1_grid, y=ld2_grid, z=region_idx, zmin=-0.5, zmax=n_cls - 0.5,
+        colorscale=colorscale, showscale=False, opacity=0.30, zsmooth="best", hoverinfo="skip",
+    ))
+    for cls in labels:
+        sub = plot_df[plot_df["Class"] == cls]
+        fig.add_trace(go.Scatter(
+            x=sub["LD1"], y=sub["LD2"], mode="markers",
+            marker=dict(color=class_colors[cls], size=7, line=dict(width=0.5, color="white")),
+            name=cls, hovertemplate=f"Class: {cls}<br>LD1: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>",
+        ))
+    for i, cls in enumerate(labels):
+        m = class_means_ld[i]
+        fig.add_trace(go.Scatter(
+            x=[m[0]], y=[m[1]], mode="markers+text",
+            marker=dict(color="black", size=11, line=dict(width=1.5, color="white")),
+            text=[f"{cls} centroid"], textposition="top center",
+            showlegend=False, hoverinfo="skip",
+        ))
+
+    # Only draw a boundary between classes whose regions actually touch
+    adjacent = np.zeros((n_cls, n_cls), dtype=bool)
+    for a, b in ((region_idx[:, :-1], region_idx[:, 1:]), (region_idx[:-1, :], region_idx[1:, :])):
+        d = a != b
+        for r1, r2 in zip(a[d], b[d]):
+            adjacent[r1, r2] = adjacent[r2, r1] = True
+
+    for bi in range(n_cls):
+        for bj in range(bi + 1, n_cls):
+            if not adjacent[bi, bj]:
+                continue
+            mi, mj = region_means[bi], region_means[bj]
+            a_coef, b_coef = mi[0] - mj[0], mi[1] - mj[1]
+            c_coef = -0.5 * (np.sum(mi ** 2) - np.sum(mj ** 2)) + np.log(priors_arr[bi] / priors_arr[bj])
+            seg = _clip_line_to_box(a_coef, b_coef, c_coef, ld1_lo, ld1_hi, ld2_lo, ld2_hi)
+            if seg is None:
+                continue
+            (x0, y0), (x1, y1) = seg
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[y0, y1], mode="lines",
+                line=dict(color="black", width=1.5, dash="dash"),
+                showlegend=False, hoverinfo="skip",
+            ))
+            fig.add_annotation(
+                x=(x0 + x1) / 2, y=(y0 + y1) / 2, text=f"{labels[bi]} | {labels[bj]}",
+                showarrow=False, font=dict(size=10, color="black"), bgcolor="rgba(255,255,255,0.7)",
             )
-        if is_hl.any():
-            traces.append(
-                go.Scatter(
-                    x=x_all[is_hl], y=y_all[is_hl], mode="markers",
-                    marker=dict(symbol="circle", size=18, color="#FFD700",
-                                line=dict(width=3, color="red")),
-                    name="Selected sample",
-                    customdata=np.stack([hover_text[is_hl], pred_text[is_hl]], axis=-1),
-                    hovertemplate="Sample: %{customdata[0]}<br>Predicted: %{customdata[1]}"
-                                  "<br>LD1: %{x:.3f}" + ("<br>LD2: %{y:.3f}" if y_col is not None else "")
-                                  + "<extra></extra>",
-                )
-            )
-        return traces
+            if abs(b_coef) > 1e-9:
+                slope, icpt = -a_coef / b_coef, -c_coef / b_coef
+                formula = f"{y_label} = ({slope:.4f})\u00b7LD1 + ({icpt:.4f})"
+            else:
+                x_b = -c_coef / a_coef
+                first, second = (labels[bi], labels[bj]) if a_coef > 0 else (labels[bj], labels[bi])
+                formula = (f"LD1 = {x_b:.4f}  (vertical line; LD1 > {x_b:.4f} \u2192 {first}, "
+                           f"LD1 < {x_b:.4f} \u2192 {second})")
+            boundary_formulas.append({"Boundary": f"{labels[bi]} vs {labels[bj]}",
+                                      "Formula (plot coordinates)": formula})
 
-    if n_components >= 2:
-        boundaries_are_exact = n_components == max_components == 2
+    if has_unknown:
+        for tr in _unknown_traces():
+            fig.add_trace(tr)
 
-        if boundaries_are_exact:
-            all_ld1 = list(plot_df["LD1"])
-            all_ld2 = list(plot_df["LD2"])
-            if has_unknown:
-                all_ld1 += list(unknown_df["LD1"])
-                all_ld2 += list(unknown_df["LD2"])
-            ld1_lo, ld1_hi = min(all_ld1), max(all_ld1)
-            ld2_lo, ld2_hi = min(all_ld2), max(all_ld2)
-            pad1 = 0.15 * (ld1_hi - ld1_lo) if ld1_hi > ld1_lo else 1.0
-            pad2 = 0.15 * (ld2_hi - ld2_lo) if ld2_hi > ld2_lo else 1.0
-            ld1_lo, ld1_hi = ld1_lo - pad1, ld1_hi + pad1
-            ld2_lo, ld2_hi = ld2_lo - pad2, ld2_hi + pad2
-
-            grid_res = 300
-            ld1_grid = np.linspace(ld1_lo, ld1_hi, grid_res)
-            ld2_grid = np.linspace(ld2_lo, ld2_hi, grid_res)
-            LD1_mesh, LD2_mesh = np.meshgrid(ld1_grid, ld2_grid)
-            mesh_points = np.stack([LD1_mesh.ravel(), LD2_mesh.ravel()], axis=1)
-            diffs = mesh_points[:, None, :] - class_means_ld[None, :, :]
-            sq_dists = np.sum(diffs ** 2, axis=2)
-            scores = -0.5 * sq_dists + np.log(priors_arr)[None, :]
-            region_idx = np.argmax(scores, axis=1).reshape(LD1_mesh.shape)
-            n_region_classes = len(class_means_ld)
-
-            colorscale = []
-            for i, cls in enumerate(labels):
-                color = class_colors[cls]
-                colorscale.append([i / n_region_classes, color])
-                colorscale.append([(i + 1) / n_region_classes, color])
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Heatmap(
-                    x=ld1_grid, y=ld2_grid, z=region_idx,
-                    zmin=-0.5, zmax=n_region_classes - 0.5,
-                    colorscale=colorscale, showscale=False,
-                    opacity=0.30, zsmooth="best", hoverinfo="skip",
-                )
-            )
-            for cls in labels:
-                sub = plot_df[plot_df["Class"] == cls]
-                fig.add_trace(
-                    go.Scatter(
-                        x=sub["LD1"], y=sub["LD2"], mode="markers",
-                        marker=dict(color=class_colors[cls], size=7,
-                                    line=dict(width=0.5, color="white")),
-                        name=cls,
-                        hovertemplate=f"Class: {cls}<br>LD1: %{{x:.3f}}<br>LD2: %{{y:.3f}}<extra></extra>",
-                    )
-                )
-            for i, cls in enumerate(labels):
-                m = class_means_ld[i]
-                fig.add_trace(
-                    go.Scatter(
-                        x=[m[0]], y=[m[1]], mode="markers+text",
-                        marker=dict(color="black", size=11, line=dict(width=1.5, color="white")),
-                        text=[f"{cls} centroid"], textposition="top center",
-                        showlegend=False, hoverinfo="skip",
-                    )
-                )
-
-            # Only draw a boundary between two classes if their regions
-            # actually touch on the grid — with >2 classes a third class can
-            # sit entirely between a given pair.
-            adjacent = np.zeros((n_region_classes, n_region_classes), dtype=bool)
-            h_diff = region_idx[:, :-1] != region_idx[:, 1:]
-            for r1, r2 in zip(region_idx[:, :-1][h_diff], region_idx[:, 1:][h_diff]):
-                adjacent[r1, r2] = adjacent[r2, r1] = True
-            v_diff = region_idx[:-1, :] != region_idx[1:, :]
-            for r1, r2 in zip(region_idx[:-1, :][v_diff], region_idx[1:, :][v_diff]):
-                adjacent[r1, r2] = adjacent[r2, r1] = True
-
-            for bi in range(n_region_classes):
-                for bj in range(bi + 1, n_region_classes):
-                    if not adjacent[bi, bj]:
-                        continue
-                    mi, mj = class_means_ld[bi], class_means_ld[bj]
-                    a_coef = mi[0] - mj[0]
-                    b_coef = mi[1] - mj[1]
-                    c_coef = -0.5 * (np.sum(mi ** 2) - np.sum(mj ** 2)) + np.log(
-                        priors_arr[bi] / priors_arr[bj]
-                    )
-                    seg = _clip_line_to_box(a_coef, b_coef, c_coef, ld1_lo, ld1_hi, ld2_lo, ld2_hi)
-                    if seg is None:
-                        continue
-                    (x0, y0), (x1, y1) = seg
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[x0, x1], y=[y0, y1], mode="lines",
-                            line=dict(color="black", width=1.5, dash="dash"),
-                            showlegend=False, hoverinfo="skip",
-                        )
-                    )
-                    fig.add_annotation(
-                        x=(x0 + x1) / 2, y=(y0 + y1) / 2,
-                        text=f"{labels[bi]} | {labels[bj]}",
-                        showarrow=False, font=dict(size=10, color="black"),
-                        bgcolor="rgba(255,255,255,0.7)",
-                    )
-                    boundary_formulas.append(
-                        {
-                            "Boundary": f"{labels[bi]} vs {labels[bj]}",
-                            "Formula (LD-space; > 0 favors first class)":
-                                f"({a_coef:.4f})·LD1 + ({b_coef:.4f})·LD2 + ({c_coef:.4f}) = 0",
-                        }
-                    )
-
-            if has_unknown:
-                for tr in _unknown_traces("LD1", "LD2"):
-                    fig.add_trace(tr)
-
-            fig.update_layout(
-                title="LDA projection (shaded decision regions)",
-                xaxis_title="LD1", yaxis_title="LD2", height=550, legend_title="Class",
-            )
-        else:
-            fig = px.scatter(
-                plot_df, x="LD1", y="LD2", color="Class",
-                title="LDA projection of the training data", opacity=0.75, height=500,
-                color_discrete_map=class_colors,
-            )
-            if has_unknown:
-                for tr in _unknown_traces("LD1", "LD2"):
-                    fig.add_trace(tr)
-    else:
-        boundaries_are_exact = False
-        fig = px.strip(
-            plot_df, x="LD1", color="Class",
-            title="LDA projection (1 component)", height=350,
-            color_discrete_map=class_colors,
-        )
-        if has_unknown:
-            for tr in _unknown_traces("LD1", None):
-                fig.add_trace(tr)
-
-    return fig, boundary_formulas, boundaries_are_exact
+    fig.update_layout(title="LDA projection (shaded decision regions)",
+                      xaxis_title="LD1", yaxis_title=y_label, height=550, legend_title="Class")
+    return fig, boundary_formulas
 
 
 # ---------------------------------------------------------------
 # Session state so results survive re-runs / interactions
 # ---------------------------------------------------------------
-if "model" not in st.session_state:
-    st.session_state.model = None
-    st.session_state.scaler = None
-    st.session_state.label_encoder = None
-    st.session_state.feature_cols = None
-    st.session_state.class_labels = None
-    st.session_state.coef_raw = None
-    st.session_state.intercept_raw = None
-    st.session_state.class_order = None
-    st.session_state.ld_formula_df = None
-    st.session_state.formula_df = None
-    st.session_state.boundary_df = None
-    st.session_state.plot_df = None
-    st.session_state.n_components = None
-    st.session_state.max_components = None
-    st.session_state.class_colors = None
-    st.session_state.class_means_ld = None
-    st.session_state.priors_arr = None
+_STATE_KEYS = [
+    "model", "scaler", "label_encoder", "feature_cols", "class_labels",
+    "coef_raw", "intercept_raw", "class_order",
+    "ld_formula_df", "formula_df", "boundary_df",
+    "plot_df", "class_colors", "class_means_ld", "region_means", "priors_arr",
+    "extra_axis", "y_label",
+]
+for _k in _STATE_KEYS:
+    st.session_state.setdefault(_k, None)
 
 
 # =================================================================
@@ -446,62 +393,58 @@ if db_file is not None:
             )
 
             # ---------------------------------------------------
-            # Example projection plot (LD1 vs LD2), analogous to
-            # the example-tree visualization in the Random Forest app
+            # 2D projection plot. With 2 classes LDA has just one
+            # axis (LD1), so a second, visualization-only axis is
+            # added (PC1 of the within-class variation).
             # ---------------------------------------------------
             st.subheader("LDA projection of the training data")
-            X_lda_all = final_lda.transform(X_scaled)
-            plot_df = pd.DataFrame({"Class": y_raw.values})
-            plot_df["LD1"] = X_lda_all[:, 0]
-            if n_components >= 2:
-                plot_df["LD2"] = X_lda_all[:, 1]
+            extra_axis = fit_extra_axis(final_lda, X_scaled, y) if n_components == 1 else None
+            ld2_is_pc = extra_axis is not None
+            y_label = "PC1 (within-class, extra axis)" if ld2_is_pc else "LD2"
+
+            X_2d = project_2d(final_lda, X_scaled, extra_axis)
+            plot_df = pd.DataFrame({"Class": y_raw.values, "LD1": X_2d[:, 0], "LD2": X_2d[:, 1]})
 
             palette = px.colors.qualitative.Set2
             class_colors = {cls: palette[i % len(palette)] for i, cls in enumerate(labels)}
 
-            class_means_ld = final_lda.transform(final_lda.means_) if n_components >= 2 else None
+            class_means_ld = project_2d(final_lda, final_lda.means_, extra_axis)
+            region_means = class_means_ld.copy()
+            if ld2_is_pc:
+                region_means[:, 1] = 0.0  # classification depends on LD1 only
             priors_arr = final_lda.priors_
 
-            fig, boundary_formulas, boundaries_are_exact = build_projection_figure(
-                labels, class_colors, plot_df, n_components, max_components,
-                class_means_ld=class_means_ld, priors_arr=priors_arr,
+            fig, boundary_formulas = build_projection_figure(
+                labels, class_colors, plot_df, class_means_ld, region_means, priors_arr,
+                y_label=y_label,
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            if n_components >= 2 and not boundaries_are_exact and n_classes > 2:
+            if ld2_is_pc:
                 st.caption(
-                    "Decision regions aren't shaded here because this plot doesn't "
-                    "contain all of the model's discriminant directions — with "
-                    f"{n_classes} classes the full model uses {max_components} "
-                    "component(s), but only 2 are shown."
+                    "With 2 classes LDA has only one discriminant axis (LD1). The vertical axis "
+                    "is the first principal component of the within-class variation, orthogonal "
+                    "to LD1. It is for visualization only and does not affect classification, "
+                    "so the decision boundary is a vertical line on LD1."
                 )
-
+            elif max_components > 2:
+                st.caption(
+                    f"The full model uses {max_components} discriminant axes; only LD1 and LD2 "
+                    "are shown, so the shaded regions and boundaries here are approximate."
+                )
             if boundary_formulas:
-                st.caption(
-                    "Dashed lines mark the linear decision boundary between each pair "
-                    "of adjacent classes in this LD1/LD2 projection — where a sample "
-                    "would score equally for both classes. These are expressed in the "
-                    "transformed LD1/LD2 coordinates of the plot, not the raw feature "
-                    "units (see the pairwise boundary formulas in section 3 for those). "
-                    "Once you classify unknown samples in step 2, they'll be overlaid "
-                    "on this same projection."
-                )
-                st.dataframe(
-                    pd.DataFrame(boundary_formulas),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(pd.DataFrame(boundary_formulas), use_container_width=True, hide_index=True)
 
-            # Store everything needed to redraw/extend this figure in step 2
             st.session_state.plot_df = plot_df
-            st.session_state.n_components = n_components
-            st.session_state.max_components = max_components
             st.session_state.class_colors = class_colors
             st.session_state.class_means_ld = class_means_ld
+            st.session_state.region_means = region_means
             st.session_state.priors_arr = priors_arr
+            st.session_state.extra_axis = extra_axis
+            st.session_state.y_label = y_label
 
             # ---------------------------------------------------
-            # Formulas — stored for display in the section below
+            # Formulas in raw feature units
             # ---------------------------------------------------
             coef_std = final_lda.coef_
             intercept_std = final_lda.intercept_
@@ -534,28 +477,41 @@ if db_file is not None:
             st.session_state.boundary_df = boundary_df
 
             # ---------------------------------------------------
-            # LD1 / LD2 formulas, i.e. the projection axes themselves,
-            # expressed in raw feature units. Since scaling + LDA.transform
-            # is an affine map (LD = A @ raw + b), we recover A and b
-            # numerically by transforming the zero vector and each unit
-            # vector — this works regardless of LDA solver internals.
+            # LD1 / second-axis formulas in raw feature units. Scaling +
+            # projection is an affine map, so we recover the intercept and
+            # coefficients numerically from the zero vector and unit vectors.
             # ---------------------------------------------------
             zeros_raw = pd.DataFrame(np.zeros((1, len(feature_cols))), columns=feature_cols)
-            baseline_ld = final_lda.transform(scaler.transform(zeros_raw))[0]
+            baseline_ld = project_2d(final_lda, scaler.transform(zeros_raw), extra_axis)[0]
 
-            ld_coef = np.zeros((len(feature_cols), n_components))
-            for j, col in enumerate(feature_cols):
+            ld_coef = np.zeros((len(feature_cols), 2))
+            for j in range(len(feature_cols)):
                 unit_raw = zeros_raw.copy()
                 unit_raw.iloc[0, j] = 1.0
-                ld_at_unit = final_lda.transform(scaler.transform(unit_raw))[0]
-                ld_coef[j, :] = ld_at_unit - baseline_ld
+                ld_coef[j, :] = project_2d(final_lda, scaler.transform(unit_raw), extra_axis)[0] - baseline_ld
 
-            ld_formula_df = pd.DataFrame(
-                ld_coef.T, index=[f"LD{k+1}" for k in range(n_components)], columns=feature_cols
-            )
+            ld_formula_df = pd.DataFrame(ld_coef.T, index=["LD1", y_label], columns=feature_cols)
             ld_formula_df.insert(0, "Intercept", baseline_ld)
-
             st.session_state.ld_formula_df = ld_formula_df
+
+            st.subheader("Formulas (in your raw feature units)")
+            st.markdown(
+                "**Class scores:** `score(class) = Intercept + \u03a3(coef \u00d7 feature)`. "
+                "A sample goes to the class with the highest score."
+            )
+            st.dataframe(formula_df.round(5), use_container_width=True)
+
+            st.markdown("**Decision boundaries:** a sample sits exactly on the boundary when "
+                        "`Intercept + \u03a3(coef \u00d7 feature) = 0`. Positive favours the first-named class.")
+            st.dataframe(boundary_df.round(5), use_container_width=True)
+
+            if n_classes == 2:
+                row = boundary_df.iloc[0]
+                terms = " ".join(f"{row[c]:+.5f}\u00b7[{c}]" for c in feature_cols)
+                st.code(f"{row['Intercept']:+.5f} {terms} = 0", language=None)
+
+            st.markdown("**Projection axes:** `axis = Intercept + \u03a3(coef \u00d7 feature)`")
+            st.dataframe(ld_formula_df.round(5), use_container_width=True)
 
 
 # =================================================================
@@ -596,19 +552,32 @@ else:
                 model = st.session_state.model
                 scaler = st.session_state.scaler
                 le = st.session_state.label_encoder
+                extra_axis = st.session_state.extra_axis
+                y_label = st.session_state.y_label
 
                 X_unknown_scaled = scaler.transform(X_unknown_valid)
                 predictions = le.inverse_transform(model.predict(X_unknown_scaled))
                 probabilities = model.predict_proba(X_unknown_scaled)
 
+                # LD1 + second-axis position of each unknown sample
+                X_unknown_2d = project_2d(model, X_unknown_scaled, extra_axis)
+
                 results = unknown_df.loc[valid_mask].copy()
                 results["Predicted_class"] = predictions
                 for i, cls in enumerate(le.classes_):
                     results[f"P({cls})"] = probabilities[:, i]
+                results["LD1"] = X_unknown_2d[:, 0]
+                results[y_label] = X_unknown_2d[:, 1]
                 results = results.reset_index(drop=True)
 
                 st.subheader("Results")
-                st.caption("Select a row below to highlight that sample in the projection plot.")
+                st.caption(
+                    "Select a row below to highlight that sample in the projection plot. "
+                    "The LD1 and second-axis columns are each sample's position on the projection "
+                    "below, computed with axis = Intercept + sum(coefficient x raw feature "
+                    "value) — see the 'LD1_LD2 formula' tab in the downloaded Excel file for "
+                    "the exact intercept and coefficients used."
+                )
                 selection_event = st.dataframe(
                     results,
                     key="results_table",
@@ -625,7 +594,18 @@ else:
 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
-                    results.to_excel(writer, index=False, sheet_name="Predictions")
+                    _write_sheet_with_notes(
+                        writer, results, "Predictions",
+                        notes=[
+                            "Each row is an unknown sample with its predicted class, "
+                            "per-class probabilities, and its position on the projection "
+                            "plot (LD1 plus LD2, or the PC1 extra axis when there are 2 classes).",
+                            "These are computed as axis = Intercept + sum(coefficient x "
+                            "raw feature value) — see the 'LD1_LD2 formula' tab for the "
+                            "exact intercept and per-feature coefficients used.",
+                        ],
+                        index=False,
+                    )
 
                     _write_sheet_with_notes(
                         writer, st.session_state.formula_df.round(5), "Classification formula",
@@ -656,9 +636,10 @@ else:
                             writer, st.session_state.ld_formula_df.round(5), "LD1_LD2 formula",
                             notes=[
                                 "This is the formula behind the projection axes used in the "
-                                "app's LD1/LD2 plots: each LD score is a linear combination of "
-                                "your raw feature values.",
-                                "LDk = Intercept + sum(coefficient x feature value)",
+                                "app's plots: each axis is a linear combination of your raw "
+                                "feature values. With 2 classes the second axis is a "
+                                "visualization-only PC1 and does not affect classification.",
+                                "axis = Intercept + sum(coefficient x feature value)",
                             ],
                             index=True, index_label="Component",
                         )
@@ -673,14 +654,14 @@ else:
                 st.caption(
                     "The Excel file includes separate tabs for the predictions, the "
                     "per-class classification formula, the pairwise decision boundary "
-                    "formulas, and the LD1/LD2 projection formula — each with an "
+                    "formulas, and the projection axis formulas — each with an "
                     "explanation of how to read it, in your raw feature units."
                 )
 
                 # ---------------------------------------------------
-                # Overlay the unknown samples onto the same LD1/LD2
-                # projection (and decision boundaries) shown in step 1,
-                # highlighting any rows currently selected in the table above
+                # Overlay the unknown samples onto the same projection
+                # (and decision boundaries) shown in step 1, highlighting
+                # any rows currently selected in the table above.
                 # ---------------------------------------------------
                 st.subheader("Projection with unknown samples")
 
@@ -691,22 +672,15 @@ else:
                 else:
                     sample_labels = [f"Row {i}" for i in unknown_df.loc[valid_mask].index]
 
-                X_unknown_lda = model.transform(X_unknown_scaled)
                 unknown_plot_df = pd.DataFrame(
-                    {"Sample": sample_labels, "Predicted_class": predictions}
+                    {"Sample": sample_labels, "Predicted_class": predictions,
+                     "LD1": X_unknown_2d[:, 0], "LD2": X_unknown_2d[:, 1]}
                 )
-                unknown_plot_df["LD1"] = X_unknown_lda[:, 0]
-                if st.session_state.n_components >= 2:
-                    unknown_plot_df["LD2"] = X_unknown_lda[:, 1]
-
-                fig2, boundary_formulas2, boundaries_are_exact2 = build_projection_figure(
+                fig2, boundary_formulas2 = build_projection_figure(
                     st.session_state.class_labels, st.session_state.class_colors,
-                    st.session_state.plot_df, st.session_state.n_components,
-                    st.session_state.max_components,
-                    class_means_ld=st.session_state.class_means_ld,
-                    priors_arr=st.session_state.priors_arr,
-                    unknown_df=unknown_plot_df,
-                    highlight_idx=selected_positions,
+                    st.session_state.plot_df, st.session_state.class_means_ld,
+                    st.session_state.region_means, st.session_state.priors_arr,
+                    y_label=y_label, unknown_df=unknown_plot_df, highlight_idx=selected_positions,
                 )
                 st.plotly_chart(fig2, use_container_width=True)
                 if selected_positions:
@@ -724,7 +698,7 @@ else:
                         "confidently it was assigned."
                     )
                 if boundary_formulas2:
-                    with st.expander("Decision boundary formulas (LD-space)"):
+                    with st.expander("Decision boundary formulas (plot coordinates)"):
                         st.dataframe(
                             pd.DataFrame(boundary_formulas2),
                             use_container_width=True,
