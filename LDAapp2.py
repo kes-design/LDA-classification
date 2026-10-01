@@ -48,6 +48,31 @@ the same feature columns to classify.
 # =================================================================
 # Helpers
 # =================================================================
+# Fixed colors per glass type. Matching is case-insensitive and looks for
+# keywords in the class (sheet) name, so "Verpakkingsglas", "verpakkingsglas "
+# or "Packaging glass" all work.
+GLASS_COLOR_RULES = [
+    (("verpakking", "packaging"), "#e41a1c"),                # packaging glass = red
+    (("flat", "float"), "#1f4fff"),                          # float glass = blue
+    (("ped", "telefoon", "phone"), "#2ca02c"),               # PED glass = green
+]
+
+
+def assign_class_colors(labels, fallback_palette):
+    colors, fallback_i = {}, 0
+    for cls in labels:
+        name = str(cls).lower()
+        color = next(
+            (c for keys, c in GLASS_COLOR_RULES if any(k in name for k in keys)),
+            None,
+        )
+        if color is None:  # unknown class: use the fallback palette
+            color = fallback_palette[fallback_i % len(fallback_palette)]
+            fallback_i += 1
+        colors[cls] = color
+    return colors
+
+
 def _clip_line_to_box(a, b, c, x_lo, x_hi, y_lo, y_hi):
     """Points where line a*x + b*y + c = 0 crosses the given box, or None
     if the line doesn't cross the visible area."""
@@ -405,8 +430,7 @@ if db_file is not None:
             X_2d = project_2d(final_lda, X_scaled, extra_axis)
             plot_df = pd.DataFrame({"Class": y_raw.values, "LD1": X_2d[:, 0], "LD2": X_2d[:, 1]})
 
-            palette = px.colors.qualitative.Set2
-            class_colors = {cls: palette[i % len(palette)] for i, cls in enumerate(labels)}
+            class_colors = assign_class_colors(labels, px.colors.qualitative.Set2)
 
             class_means_ld = project_2d(final_lda, final_lda.means_, extra_axis)
             region_means = class_means_ld.copy()
