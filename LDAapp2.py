@@ -50,9 +50,9 @@ the same feature columns to classify.
 # =================================================================
 # Fixed colors per glass type. Matching is case-insensitive and looks for
 # keywords in the class (sheet) name, so "Verpakkingsglas", "verpakkingsglas "
-# or "Packaging glass" all work.
+# or "container glass" all work.
 GLASS_COLOR_RULES = [
-    (("verpakking", "packaging"), "#e41a1c"),                # packaging glass = red
+    (("verpakking", "container"), "#e41a1c"),                # container glass = red
     (("flat", "float"), "#1f4fff"),                          # float glass = blue
     (("ped", "telefoon", "phone"), "#2ca02c"),               # PED glass = green
 ]
