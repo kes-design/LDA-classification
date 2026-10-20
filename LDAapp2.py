@@ -37,8 +37,8 @@ st.title("LDA Classifier")
 
 st.markdown(
     """
-Upload a **database file** where each sheet is a class (e.g. `Flatglas`,
-`Verpakkingsglas`, `Telefoonglas`) and rows are samples with feature
+Upload a **database file** where each sheet is a class (e.g. `Float glass`,
+`Container Glass`, `PED glass`) and rows are samples with feature
 concentrations as columns. Then upload an **unknown samples file** with
 the same feature columns to classify.
 """
