@@ -395,12 +395,6 @@ if db_file is not None:
                 st.text("Confusion matrix:")
                 st.dataframe(pd.DataFrame(cm, index=labels, columns=labels))
 
-            st.subheader("Explained variance ratio")
-            ev = pd.Series(
-                eval_lda.explained_variance_ratio_,
-                index=[f"LD{i+1}" for i in range(len(eval_lda.explained_variance_ratio_))],
-            )
-            st.bar_chart(ev)
 
             # Final model trained on ALL data (used for real classification)
             final_lda = LinearDiscriminantAnalysis(n_components=n_components)
